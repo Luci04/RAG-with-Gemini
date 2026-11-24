@@ -1,4 +1,5 @@
 import "dotenv/config"
+import fs from "fs"
 import { Worker } from "bullmq"
 import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai"
 import { TaskType } from "@google/generative-ai"
@@ -20,8 +21,14 @@ const worker = new Worker(
     if (!data.userId) {
       throw new Error("Missing userId on job — reject unscoped indexing")
     }
+    if (!data.path || !fs.existsSync(data.path)) {
+      throw new Error(`PDF not found at path: ${data.path}`)
+    }
 
     const docs = await new PDFLoader(data.path).load()
+    if (!docs.length) {
+      throw new Error("PDFLoader returned 0 pages")
+    }
 
     const splitter = new RecursiveCharacterTextSplitter({
       chunkSize: CHUNK_SIZE,
@@ -39,7 +46,7 @@ const worker = new Worker(
       }
     }
 
-    console.log(`user=${data.userId} pages=${docs.length} chunks=${chunks.length}`)
+    console.log(`user=${data.userId} pages=${docs.length} chunks=${chunks.length} file=${data.path}`)
 
     const embeddings = new GoogleGenerativeAIEmbeddings({
       apiKey: process.env.GOOGLE_API_KEY,
@@ -47,10 +54,21 @@ const worker = new Worker(
       taskType: TaskType.RETRIEVAL_DOCUMENT,
     })
 
-    await QdrantVectorStore.fromDocuments(chunks, embeddings, {
+    const store = await QdrantVectorStore.fromExistingCollection(embeddings, {
       url: QDRANT_URL,
       collectionName: COLLECTION,
     })
+    await store.addDocuments(chunks)
+
+    // Make userId filterable in Qdrant
+    try {
+      await store.client.createPayloadIndex(COLLECTION, {
+        field_name: "metadata.userId",
+        field_schema: "keyword",
+      })
+    } catch {
+      // index may already exist
+    }
 
     console.log(`stored ${chunks.length} chunks for ${data.userId} → ${COLLECTION}`)
   },
