@@ -1,5 +1,6 @@
 "use client"
 
+import { useAuth } from "@clerk/nextjs"
 import { FormEvent, useEffect, useRef, useState } from "react"
 import { Loader2, Mic, MicOff, SendHorizontal, Trash2 } from "lucide-react"
 
@@ -52,6 +53,7 @@ declare global {
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"
 
 export function Chat() {
+  const { getToken } = useAuth()
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState("")
   const [loading, setLoading] = useState(false)
@@ -163,7 +165,14 @@ export function Chat() {
     setLoading(true)
 
     try {
-      const res = await fetch(`${API_URL}/search?q=${encodeURIComponent(question)}`)
+      const token = await getToken()
+      if (!token) throw new Error("Not signed in")
+
+      const res = await fetch(`${API_URL}/search?q=${encodeURIComponent(question)}`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || "Search failed")
 

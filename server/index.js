@@ -1,9 +1,11 @@
 import "dotenv/config"
 import express from "express"
 import cors from "cors"
+import fs from "fs"
 import multer from "multer"
 import path from "path"
 import { Queue } from "bullmq"
+import { clerkMiddleware, getAuth } from "@clerk/express"
 import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai"
 import { GoogleGenerativeAI, TaskType } from "@google/generative-ai"
 import { QdrantVectorStore } from "@langchain/qdrant"
@@ -18,7 +20,6 @@ const pdfQueue = new Queue("pdf-processing", {
   },
 })
 
-// Must use the SAME embedding model as worker.js (gemini-embedding-001)
 const embeddings = new GoogleGenerativeAIEmbeddings({
   apiKey: process.env.GOOGLE_API_KEY,
   model: "gemini-embedding-001",
@@ -30,11 +31,13 @@ const vectorStore = await QdrantVectorStore.fromExistingCollection(embeddings, {
   collectionName: "pdf-docs",
 })
 
-// k = how many chunks to return. Higher = more context, more noise.
-const retriever = vectorStore.asRetriever({ k: 4 })
-
 const storage = multer.diskStorage({
-  destination: "uploads/pdf",
+  destination: (req, file, cb) => {
+    const { userId } = getAuth(req)
+    const dir = path.join("uploads/pdf", userId || "anonymous")
+    fs.mkdirSync(dir, { recursive: true })
+    cb(null, dir)
+  },
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname)
     const base = path.basename(file.originalname, ext)
@@ -44,24 +47,44 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage })
 
-app.use(cors())
+app.use(
+  cors({
+    origin: process.env.CLIENT_ORIGIN ?? "http://localhost:3000",
+    credentials: true,
+    allowedHeaders: ["Authorization", "Content-Type"],
+  })
+)
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
+app.use(clerkMiddleware())
+
+function requireUser(req, res, next) {
+  const { userId } = getAuth(req)
+  if (!userId) {
+    return res.status(401).json({ error: "Unauthorized — sign in and send a Bearer token" })
+  }
+  next()
+}
 
 app.get("/", (req, res) => {
   res.send("Hello World")
 })
 
-app.get("/search", async (req, res) => {
+app.get("/search", requireUser, async (req, res) => {
   try {
-    // 1) User question (?q=... or hardcoded for testing)
-    const query = req.query.q || "Who is Avinash Shukla"
+    const { userId } = getAuth(req)
+    const query = String(req.query.q || "").trim()
+    if (!query) {
+      return res.status(400).json({ error: "Missing query parameter q" })
+    }
 
-    // 2) Retrieve similar chunks from Qdrant (embeddings → nearest neighbors)
-    const docs = await retriever.invoke(query)
+    // Only search this user's chunks
+    const docs = await vectorStore.similaritySearch(query, 4, {
+      must: [{ key: "metadata.userId", match: { value: userId } }],
+    })
+
     const context = docs.map((d, i) => `[${i + 1}] ${d.pageContent}`).join("\n\n")
 
-    // 3) Build one prompt: instructions + retrieved docs + question
     const prompt = `You are a helpful assistant. Answer ONLY using the documents below.
 If the answer is not in the documents, say "I don't know".
 
@@ -72,13 +95,13 @@ Question: ${query}
 
 Answer:`
 
-    // 4) Ask Gemini to write the final answer
-    const model = genAI.getGenerativeModel({  model: "gemini-3.5-flash-lite"})
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" })
     const result = await model.generateContent(prompt)
     const answer = result.response.text()
 
     res.json({
       answer,
+      userId,
       sources: docs.map((d) => ({
         content: d.pageContent,
         metadata: d.metadata,
@@ -90,20 +113,25 @@ Answer:`
   }
 })
 
-app.post("/upload/pdf", upload.single("file"), async (req, res) => {
+app.post("/upload/pdf", requireUser, upload.single("file"), async (req, res) => {
+  const { userId } = getAuth(req)
+
   if (!req.file) {
     return res.status(400).json({ error: "No file uploaded" })
   }
+
   const job = await pdfQueue.add(
     "process-pdf",
     JSON.stringify({
+      userId,
       filename: req.file.filename,
       originalname: req.file.originalname,
       path: req.file.path,
       source: req.file.destination,
     })
   )
-  res.json({ message: "File uploaded", jobId: job.id })
+
+  res.json({ message: "File uploaded", jobId: job.id, userId })
 })
 
 app.listen(8000, () => {

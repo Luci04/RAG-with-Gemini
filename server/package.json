@@ -12,6 +12,7 @@
     "worker": "nodemon worker.js"
   },
   "dependencies": {
+    "@clerk/express": "^2.1.97",
     "@google/genai": "^3.6.1",
     "@google/generative-ai": "^0.24.1",
     "@langchain/community": "^0.3.59",
