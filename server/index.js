@@ -37,21 +37,39 @@ const vectorStore = await QdrantVectorStore.fromExistingCollection(embeddings, {
   collectionName: COLLECTION,
 })
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const userId = req.authUserId || "anonymous"
-    const dir = path.join("uploads/pdf", userId)
-    fs.mkdirSync(dir, { recursive: true })
-    cb(null, dir)
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname)
-    const base = path.basename(file.originalname, ext)
-    cb(null, `${base}-${Date.now()}${ext}`)
+function makeStorage(subdir) {
+  return multer.diskStorage({
+    destination: (req, file, cb) => {
+      const userId = req.authUserId || "anonymous"
+      const dir = path.join("uploads", subdir, userId)
+      fs.mkdirSync(dir, { recursive: true })
+      cb(null, dir)
+    },
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname)
+      const base = path.basename(file.originalname, ext)
+      cb(null, `${base}-${Date.now()}${ext}`)
+    },
+  })
+}
+
+const uploadPdf = multer({
+  storage: makeStorage("pdf"),
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype === "application/pdf") cb(null, true)
+    else cb(new Error("Only PDF files are allowed"))
   },
 })
 
-const upload = multer({ storage })
+const IMAGE_MIME = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"])
+const uploadImage = multer({
+  storage: makeStorage("images"),
+  fileFilter: (_req, file, cb) => {
+    if (IMAGE_MIME.has(file.mimetype)) cb(null, true)
+    else cb(new Error("Only image files (png, jpg, webp, gif) are allowed"))
+  },
+  limits: { fileSize: 10 * 1024 * 1024 },
+})
 
 app.use(
   cors({
@@ -73,24 +91,42 @@ function requireUser(req, res, next) {
   next()
 }
 
+function assertOwnedUpload(userId, rawPath, roots) {
+  const absolute = path.resolve(rawPath)
+  for (const root of roots) {
+    const uploadsRoot = path.resolve(root)
+    if (!absolute.startsWith(uploadsRoot + path.sep) && absolute !== uploadsRoot) continue
+
+    const relative = path.relative(uploadsRoot, absolute)
+    const topFolder = relative.split(path.sep)[0]
+    const isUserScoped = topFolder === userId
+    const isLegacyFlat = !relative.includes(path.sep)
+    if (isUserScoped || isLegacyFlat) {
+      return absolute
+    }
+  }
+  return null
+}
+
 async function searchUserDocs(query, userId, k = 4) {
-  // 1) Preferred: chunks tagged with this userId
   let docs = await vectorStore.similaritySearch(query, k, {
     must: [{ key: "metadata.userId", match: { value: userId } }],
   })
 
   if (docs.length > 0) return { docs, mode: "userId" }
 
-  // 2) Path-scoped uploads: uploads/pdf/<userId>/...
   const broad = await vectorStore.similaritySearch(query, Math.max(k * 3, 12))
   docs = broad.filter((d) => {
     const source = String(d.metadata?.source || "")
     const metaUser = d.metadata?.userId
-    return metaUser === userId || source.includes(`/uploads/pdf/${userId}/`) || source.includes(`uploads/pdf/${userId}/`)
+    return (
+      metaUser === userId ||
+      source.includes(`uploads/pdf/${userId}/`) ||
+      source.includes(`uploads/images/${userId}/`)
+    )
   })
   if (docs.length > 0) return { docs: docs.slice(0, k), mode: "path" }
 
-  // 3) Legacy index (no userId on any chunk yet) — allow so demo still works
   const hasAnyUserScoped = broad.some((d) => d.metadata?.userId)
   if (!hasAnyUserScoped) {
     console.warn(`[search] legacy Qdrant index has no userId tags; returning unscoped hits for ${userId}`)
@@ -120,17 +156,24 @@ app.get("/search", requireUser, async (req, res) => {
     if (docs.length === 0) {
       return res.json({
         answer:
-          "I couldn't find any indexed documents for your account. Please re-upload your PDF and wait for processing to finish, then try again.",
+          "I couldn't find any indexed documents for your account. Please upload a PDF or image and wait for processing to finish, then try again.",
         userId,
         sources: [],
         retrievalMode: mode,
       })
     }
 
-    const context = docs.map((d, i) => `[${i + 1}] ${d.pageContent}`).join("\n\n")
+    const context = docs
+      .map((d, i) => {
+        const kind = d.metadata?.type === "image" ? "Image OCR" : "PDF"
+        const name = d.metadata?.originalname || d.metadata?.filename || "document"
+        return `[${i + 1}] (${kind}: ${name})\n${d.pageContent}`
+      })
+      .join("\n\n")
 
-    const prompt = `You are a helpful assistant. Answer the question using the documents below.
+    const prompt = `You are a helpful assistant. Answer the question using the documents below (PDF text and/or OCR text from images).
 Prefer information from the documents. If the documents are unrelated to the question, say "I don't know".
+When an answer comes from an image, mention that it was found in an image.
 
 Documents:
 ${context}
@@ -158,26 +201,54 @@ Answer:`
   }
 })
 
-app.post("/upload/pdf", requireUser, upload.single("file"), async (req, res) => {
-  const userId = req.authUserId
+app.post("/upload/pdf", requireUser, (req, res) => {
+  uploadPdf.single("file")(req, res, async (err) => {
+    if (err) return res.status(400).json({ error: err.message })
+    const userId = req.authUserId
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" })
 
-  if (!req.file) {
-    return res.status(400).json({ error: "No file uploaded" })
-  }
+    const job = await pdfQueue.add("process-pdf", {
+      type: "pdf",
+      userId,
+      filename: req.file.filename,
+      originalname: req.file.originalname,
+      path: req.file.path,
+      source: req.file.destination,
+      mimeType: req.file.mimetype,
+    })
 
-  const job = await pdfQueue.add("process-pdf", {
-    userId,
-    filename: req.file.filename,
-    originalname: req.file.originalname,
-    path: req.file.path,
-    source: req.file.destination,
+    res.json({ message: "PDF uploaded", jobId: job.id, userId, path: req.file.path, type: "pdf" })
   })
-
-  res.json({ message: "File uploaded", jobId: job.id, userId, path: req.file.path })
 })
 
-/** Authenticated PDF open — used by citation links (page jump via #page=N in the browser) */
-app.get("/files/pdf", requireUser, async (req, res) => {
+app.post("/upload/image", requireUser, (req, res) => {
+  uploadImage.single("image")(req, res, async (err) => {
+    if (err) return res.status(400).json({ error: err.message })
+    const userId = req.authUserId
+    if (!req.file) return res.status(400).json({ error: "No image uploaded" })
+
+    const job = await pdfQueue.add("process-image", {
+      type: "image",
+      userId,
+      filename: req.file.filename,
+      originalname: req.file.originalname,
+      path: req.file.path,
+      source: req.file.destination,
+      mimeType: req.file.mimetype,
+    })
+
+    res.json({
+      message: "Image uploaded — OCR + embedding queued",
+      jobId: job.id,
+      userId,
+      path: req.file.path,
+      type: "image",
+    })
+  })
+})
+
+/** Authenticated file open for PDF / image citations */
+app.get("/files", requireUser, async (req, res) => {
   try {
     const userId = req.authUserId
     const rawPath = String(req.query.path || "").trim()
@@ -185,33 +256,38 @@ app.get("/files/pdf", requireUser, async (req, res) => {
       return res.status(400).json({ error: "Missing path query param" })
     }
 
-    // Normalize and lock to uploads/pdf
-    const uploadsRoot = path.resolve("uploads/pdf")
-    const absolute = path.resolve(rawPath)
-    if (!absolute.startsWith(uploadsRoot + path.sep) && absolute !== uploadsRoot) {
-      return res.status(403).json({ error: "Invalid file path" })
-    }
-
-    // Owner check: file under uploads/pdf/<userId>/... OR legacy flat file (any signed-in owner of legacy)
-    const relative = path.relative(uploadsRoot, absolute)
-    const topFolder = relative.split(path.sep)[0]
-    const isUserScoped = topFolder === userId
-    const isLegacyFlat = !relative.includes(path.sep) // file directly in uploads/pdf
-    if (!isUserScoped && !isLegacyFlat) {
+    const absolute = assertOwnedUpload(userId, rawPath, ["uploads/pdf", "uploads/images"])
+    if (!absolute) {
       return res.status(403).json({ error: "You do not have access to this file" })
     }
-
     if (!fs.existsSync(absolute)) {
-      return res.status(404).json({ error: "File not found on disk — re-upload the PDF" })
+      return res.status(404).json({ error: "File not found on disk — re-upload it" })
     }
 
-    res.setHeader("Content-Type", "application/pdf")
+    const ext = path.extname(absolute).toLowerCase()
+    const type =
+      ext === ".pdf"
+        ? "application/pdf"
+        : ext === ".png"
+          ? "image/png"
+          : ext === ".webp"
+            ? "image/webp"
+            : ext === ".gif"
+              ? "image/gif"
+              : "image/jpeg"
+
+    res.setHeader("Content-Type", type)
     res.setHeader("Content-Disposition", `inline; filename="${path.basename(absolute)}"`)
     fs.createReadStream(absolute).pipe(res)
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: err.message })
   }
+})
+
+// Back-compat alias used by older citation links
+app.get("/files/pdf", requireUser, (req, res) => {
+  res.redirect(307, `/files?path=${encodeURIComponent(String(req.query.path || ""))}`)
 })
 
 app.listen(8000, () => {

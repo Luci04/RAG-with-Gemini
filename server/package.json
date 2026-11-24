@@ -29,7 +29,8 @@
     "mongoose": "^9.13.0",
     "multer": "^2.5.0",
     "openai": "^4.104.0",
-    "pdf-parse": "^1.1.4"
+    "pdf-parse": "^1.1.4",
+    "tesseract.js": "^7.0.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
