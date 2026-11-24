@@ -2,11 +2,19 @@
 
 import { useAuth } from "@clerk/nextjs"
 import { ChangeEvent, DragEvent, useRef, useState } from "react"
-import { CheckCircle2, FileText, Loader2, UploadCloud, XCircle } from "lucide-react"
+import { CheckCircle2, FileText, ImageIcon, Loader2, UploadCloud, XCircle } from "lucide-react"
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"
 
 type UploadStatus = "idle" | "uploading" | "success" | "error"
+
+const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"])
+
+function detectKind(file: File): "pdf" | "image" | null {
+  if (file.type === "application/pdf") return "pdf"
+  if (IMAGE_TYPES.has(file.type)) return "image"
+  return null
+}
 
 export function FileUpload() {
   const { getToken } = useAuth()
@@ -22,9 +30,10 @@ export function FileUpload() {
   }
 
   const uploadFile = async (file: File) => {
-    if (file.type !== "application/pdf") {
+    const kind = detectKind(file)
+    if (!kind) {
       setStatus("error")
-      setMessage("Only PDF files are supported.")
+      setMessage("Only PDF or image files (png, jpg, webp, gif) are supported.")
       setFileName(file.name)
       return
     }
@@ -40,13 +49,13 @@ export function FileUpload() {
     setFileName(file.name)
     setStatus("uploading")
     setProgress(0)
-    setMessage("Uploading…")
+    setMessage(kind === "image" ? "Uploading image for OCR…" : "Uploading PDF…")
 
     const formData = new FormData()
-    formData.append("file", file)
+    formData.append(kind === "image" ? "image" : "file", file)
 
     const xhr = new XMLHttpRequest()
-    xhr.open("POST", `${API_URL}/upload/pdf`)
+    xhr.open("POST", `${API_URL}/upload/${kind === "image" ? "image" : "pdf"}`)
     xhr.setRequestHeader("Authorization", `Bearer ${token}`)
 
     xhr.upload.onprogress = (event) => {
@@ -61,7 +70,13 @@ export function FileUpload() {
         if (xhr.status >= 200 && xhr.status < 300) {
           setProgress(100)
           setStatus("success")
-          setMessage(data.jobId ? `Uploaded · job ${data.jobId}` : "Uploaded successfully")
+          setMessage(
+            kind === "image"
+              ? `Image queued for OCR · job ${data.jobId}`
+              : data.jobId
+                ? `Uploaded · job ${data.jobId}`
+                : "Uploaded successfully"
+          )
         } else {
           setStatus("error")
           setMessage(data.error || (xhr.status === 401 ? "Unauthorized" : "Upload failed"))
@@ -129,16 +144,26 @@ export function FileUpload() {
         <input
           ref={inputRef}
           type="file"
-          accept="application/pdf"
+          accept="application/pdf,image/png,image/jpeg,image/webp,image/gif"
           className="hidden"
           onChange={onFileChange}
         />
 
         <UploadCloud className="mb-3 h-10 w-10 text-gray-700 dark:text-gray-200" />
         <p className="text-sm font-medium text-gray-900 dark:text-gray-100">
-          {dragging ? "Drop your PDF here" : "Drag & drop a PDF here"}
+          {dragging ? "Drop your file here" : "Drag & drop a PDF or image"}
         </p>
-        <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">or click to browse · PDF only</p>
+        <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+          or click to browse · PDF / PNG / JPG / WebP
+        </p>
+        <div className="mt-3 flex items-center gap-3 text-[11px] text-gray-400">
+          <span className="inline-flex items-center gap-1">
+            <FileText className="h-3.5 w-3.5" /> PDF text
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <ImageIcon className="h-3.5 w-3.5" /> Image OCR
+          </span>
+        </div>
       </div>
 
       {(status !== "idle" || fileName) && (

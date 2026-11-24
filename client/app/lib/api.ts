@@ -4,6 +4,11 @@ export type ChatSource = {
   content: string
   metadata?: {
     source?: string
+    type?: "pdf" | "image" | string
+    originalname?: string
+    filename?: string
+    mimeType?: string
+    ocrConfidence?: number
     loc?: { pageNumber?: number }
   }
 }
@@ -105,23 +110,34 @@ export async function searchPdf(token: string, question: string) {
   return data as { answer: string; sources: ChatSource[] }
 }
 
-/** Fetch PDF with auth, open in a new tab at the given page (#page=N). */
-export async function openPdfAtPage(token: string, sourcePath: string, pageNumber?: number) {
-  const res = await fetch(
-    `${API_URL}/files/pdf?path=${encodeURIComponent(sourcePath)}`,
-    { headers: { Authorization: `Bearer ${token}` } }
-  )
+/** Fetch a stored PDF/image with auth and open it (PDFs jump to #page=N). */
+export async function openSourceFile(
+  token: string,
+  sourcePath: string,
+  options?: { pageNumber?: number; type?: string }
+) {
+  const res = await fetch(`${API_URL}/files?path=${encodeURIComponent(sourcePath)}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
   if (!res.ok) {
     const data = await res.json().catch(() => ({}))
-    throw new Error(data.error || "Could not open PDF")
+    throw new Error(data.error || "Could not open file")
   }
 
   const blob = await res.blob()
   const objectUrl = URL.createObjectURL(blob)
-  const page = pageNumber && pageNumber > 0 ? pageNumber : 1
-  // Chrome/Edge honor #page=N for PDF blobs
-  window.open(`${objectUrl}#page=${page}`, "_blank", "noopener,noreferrer")
+  const isPdf = options?.type === "pdf" || sourcePath.toLowerCase().endsWith(".pdf")
+  const page = options?.pageNumber && options.pageNumber > 0 ? options.pageNumber : 1
+  window.open(
+    isPdf ? `${objectUrl}#page=${page}` : objectUrl,
+    "_blank",
+    "noopener,noreferrer"
+  )
 
-  // Revoke later so the tab has time to load
   setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000)
+}
+
+/** @deprecated use openSourceFile */
+export async function openPdfAtPage(token: string, sourcePath: string, pageNumber?: number) {
+  return openSourceFile(token, sourcePath, { pageNumber, type: "pdf" })
 }

@@ -9,7 +9,7 @@ import {
   ChatSource,
   createChat,
   getChat,
-  openPdfAtPage,
+  openSourceFile,
   searchPdf,
   updateChat,
 } from "../lib/api"
@@ -288,15 +288,18 @@ export function Chat({ chatId, onChatChange, onHistoryRefresh }: Props) {
   const openSource = async (source: ChatSource) => {
     const sourcePath = source.metadata?.source
     if (!sourcePath) {
-      setError("This source has no PDF path")
+      setError("This source has no file path")
       return
     }
     try {
       const token = await getToken()
       if (!token) throw new Error("Not signed in")
-      await openPdfAtPage(token, sourcePath, source.metadata?.loc?.pageNumber)
+      await openSourceFile(token, sourcePath, {
+        pageNumber: source.metadata?.loc?.pageNumber,
+        type: source.metadata?.type,
+      })
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not open PDF")
+      setError(err instanceof Error ? err.message : "Could not open file")
     }
   }
 
@@ -395,8 +398,11 @@ export function Chat({ chatId, onChatChange, onHistoryRefresh }: Props) {
                   </summary>
                   <ul className="mt-2 space-y-2">
                     {message.sources.map((source, index) => {
+                      const isImage = source.metadata?.type === "image"
                       const fileName =
-                        source.metadata?.source?.split("/").pop() ?? `Source ${index + 1}`
+                        source.metadata?.originalname ||
+                        source.metadata?.source?.split("/").pop() ||
+                        `Source ${index + 1}`
                       const page = source.metadata?.loc?.pageNumber
                       return (
                         <li
@@ -407,10 +413,10 @@ export function Chat({ chatId, onChatChange, onHistoryRefresh }: Props) {
                             type="button"
                             onClick={() => void openSource(source)}
                             className="mb-1 text-left font-medium text-blue-700 underline-offset-2 hover:underline dark:text-blue-300"
-                            title="Open PDF at this page"
+                            title={isImage ? "Open image" : "Open PDF at this page"}
                           >
-                            {fileName}
-                            {page ? ` · p.${page}` : ""}
+                            [{isImage ? "image" : "pdf"}] {fileName}
+                            {isImage ? " · OCR" : page ? ` · p.${page}` : ""}
                             <span className="ml-1 font-normal text-gray-400 no-underline">↗</span>
                           </button>
                           <p className="line-clamp-4 whitespace-pre-wrap">{source.content}</p>
