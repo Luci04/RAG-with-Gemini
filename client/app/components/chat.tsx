@@ -2,22 +2,17 @@
 
 import { useAuth } from "@clerk/nextjs"
 import { FormEvent, useEffect, useRef, useState } from "react"
-import { Loader2, Mic, MicOff, SendHorizontal, Trash2 } from "lucide-react"
-
-type Source = {
-  content: string
-  metadata?: {
-    source?: string
-    loc?: { pageNumber?: number }
-  }
-}
-
-type Message = {
-  id: string
-  role: "user" | "assistant"
-  content: string
-  sources?: Source[]
-}
+import { Eye, EyeOff, Loader2, Mic, MicOff, SendHorizontal, Share2 } from "lucide-react"
+import {
+  appendMessages,
+  ChatMessage,
+  ChatSource,
+  createChat,
+  getChat,
+  openPdfAtPage,
+  searchPdf,
+  updateChat,
+} from "../lib/api"
 
 type SpeechRecognitionResultLike = {
   isFinal: boolean
@@ -50,20 +45,34 @@ declare global {
   }
 }
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"
+type Props = {
+  chatId: string | null
+  onChatChange: (chatId: string | null) => void
+  onHistoryRefresh: () => void
+}
 
-export function Chat() {
+export function Chat({ chatId, onChatChange, onHistoryRefresh }: Props) {
   const { getToken } = useAuth()
-  const [messages, setMessages] = useState<Message[]>([])
+  const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [title, setTitle] = useState("New chat")
+  const [isReadable, setIsReadable] = useState(false)
+  const [readOnly, setReadOnly] = useState(false)
   const [input, setInput] = useState("")
   const [loading, setLoading] = useState(false)
+  const [loadingChat, setLoadingChat] = useState(false)
   const [listening, setListening] = useState(false)
   const [speechSupported, setSpeechSupported] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [copied, setCopied] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null)
   const baseInputRef = useRef("")
+  const activeChatIdRef = useRef<string | null>(chatId)
+
+  useEffect(() => {
+    activeChatIdRef.current = chatId
+  }, [chatId])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" })
@@ -107,10 +116,7 @@ export function Chat() {
       setListening(false)
     }
 
-    recognition.onend = () => {
-      setListening(false)
-    }
-
+    recognition.onend = () => setListening(false)
     recognitionRef.current = recognition
 
     return () => {
@@ -122,7 +128,48 @@ export function Chat() {
     }
   }, [])
 
+  useEffect(() => {
+    let cancelled = false
+
+    const load = async () => {
+      if (!chatId) {
+        setMessages([])
+        setTitle("New chat")
+        setIsReadable(false)
+        setReadOnly(false)
+        setError(null)
+        return
+      }
+
+      setLoadingChat(true)
+      setError(null)
+      try {
+        const token = await getToken()
+        if (!token) throw new Error("Not signed in")
+        const chat = await getChat(token, chatId)
+        if (cancelled) return
+        setMessages(chat.messages || [])
+        setTitle(chat.title)
+        setIsReadable(chat.isReadable)
+        setReadOnly(chat.readOnly)
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : "Failed to load chat")
+          setMessages([])
+        }
+      } finally {
+        if (!cancelled) setLoadingChat(false)
+      }
+    }
+
+    void load()
+    return () => {
+      cancelled = true
+    }
+  }, [chatId, getToken])
+
   const toggleListening = () => {
+    if (readOnly) return
     const recognition = recognitionRef.current
     if (!recognition) {
       setError("Speech recognition is not supported in this browser. Try Chrome.")
@@ -146,45 +193,59 @@ export function Chat() {
     }
   }
 
+  const ensureChat = async (token: string, firstQuestion: string) => {
+    if (activeChatIdRef.current) return activeChatIdRef.current
+    const created = await createChat(token, {
+      title: firstQuestion.slice(0, 60),
+      isReadable: false,
+    })
+    activeChatIdRef.current = created.id
+    onChatChange(created.id)
+    setTitle(created.title)
+    setIsReadable(created.isReadable)
+    setReadOnly(false)
+    return created.id
+  }
+
   const sendMessage = async (text: string) => {
     const question = text.trim()
-    if (!question || loading) return
+    if (!question || loading || readOnly) return
 
     if (listening) {
       recognitionRef.current?.stop()
       setListening(false)
     }
 
+    const userMessage: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: "user",
+      content: question,
+    }
+
     setError(null)
     setInput("")
     baseInputRef.current = ""
-    setMessages((prev) => [
-      ...prev,
-      { id: crypto.randomUUID(), role: "user", content: question },
-    ])
+    setMessages((prev) => [...prev, userMessage])
     setLoading(true)
 
     try {
       const token = await getToken()
       if (!token) throw new Error("Not signed in")
 
-      const res = await fetch(`${API_URL}/search?q=${encodeURIComponent(question)}`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || "Search failed")
+      const id = await ensureChat(token, question)
+      const data = await searchPdf(token, question)
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          role: "assistant",
-          content: data.answer ?? "No answer returned.",
-          sources: data.sources ?? [],
-        },
-      ])
+      const assistantMessage: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: data.answer ?? "No answer returned.",
+        sources: data.sources ?? [],
+      }
+
+      setMessages((prev) => [...prev, assistantMessage])
+      const saved = await appendMessages(token, id, [userMessage, assistantMessage])
+      setTitle(saved.title)
+      onHistoryRefresh()
     } catch (err) {
       const message = err instanceof Error ? err.message : "Something went wrong"
       setError(message)
@@ -202,6 +263,43 @@ export function Chat() {
     }
   }
 
+  const toggleReadable = async () => {
+    if (!chatId || readOnly) return
+    try {
+      const token = await getToken()
+      if (!token) throw new Error("Not signed in")
+      const next = !isReadable
+      const updated = await updateChat(token, chatId, { isReadable: next })
+      setIsReadable(updated.isReadable)
+      onHistoryRefresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update share setting")
+    }
+  }
+
+  const copyShareLink = async () => {
+    if (!chatId) return
+    const url = `${window.location.origin}/?chat=${chatId}`
+    await navigator.clipboard.writeText(url)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
+
+  const openSource = async (source: ChatSource) => {
+    const sourcePath = source.metadata?.source
+    if (!sourcePath) {
+      setError("This source has no PDF path")
+      return
+    }
+    try {
+      const token = await getToken()
+      if (!token) throw new Error("Not signed in")
+      await openPdfAtPage(token, sourcePath, source.metadata?.loc?.pageNumber)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not open PDF")
+    }
+  }
+
   const onSubmit = (e: FormEvent) => {
     e.preventDefault()
     void sendMessage(input)
@@ -209,47 +307,71 @@ export function Chat() {
 
   return (
     <div className="flex h-full min-h-0 w-full flex-col overflow-hidden">
-      <div className="flex shrink-0 items-center justify-between border-b border-gray-200 px-1 pb-3 dark:border-gray-800">
-        <div>
-          <h2 className="text-lg font-semibold tracking-tight">Chat with PDF</h2>
-          <p className="text-sm text-gray-500 dark:text-gray-400">Ask questions about your uploaded documents</p>
+      <div className="flex shrink-0 items-start justify-between gap-3 border-b border-gray-200 px-1 pb-3 dark:border-gray-800">
+        <div className="min-w-0">
+          <h2 className="truncate text-lg font-semibold tracking-tight">{title}</h2>
+          <p className="text-sm text-gray-500 dark:text-gray-400">
+            {readOnly
+              ? "Read-only shared chat"
+              : "Ask questions about your uploaded documents"}
+          </p>
         </div>
-        {messages.length > 0 && (
-          <button
-            type="button"
-            onClick={() => {
-              setMessages([])
-              setError(null)
-            }}
-            className="inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-sm text-gray-500 hover:bg-gray-100 hover:text-gray-900 dark:hover:bg-gray-900 dark:hover:text-gray-100"
-            aria-label="Clear chat"
-          >
-            <Trash2 className="h-4 w-4" />
-            Clear
-          </button>
+
+        {chatId && !readOnly && (
+          <div className="flex shrink-0 items-center gap-1">
+            <button
+              type="button"
+              onClick={() => void toggleReadable()}
+              className="inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-900"
+              title={isReadable ? "Make private" : "Make readable by others"}
+            >
+              {isReadable ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
+              {isReadable ? "Shared" : "Private"}
+            </button>
+            {isReadable && (
+              <button
+                type="button"
+                onClick={() => void copyShareLink()}
+                className="inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-900"
+              >
+                <Share2 className="h-3.5 w-3.5" />
+                {copied ? "Copied" : "Copy link"}
+              </button>
+            )}
+          </div>
         )}
       </div>
 
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto py-4 pr-1">
-        {messages.length === 0 && !loading && (
+        {loadingChat && (
+          <div className="flex h-full items-center justify-center text-sm text-gray-400">
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading chat…
+          </div>
+        )}
+
+        {!loadingChat && messages.length === 0 && !loading && (
           <div className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center">
             <p className="text-sm text-gray-500 dark:text-gray-400">
-              Upload a PDF on the left, then ask something like:
+              {readOnly
+                ? "This shared chat has no messages."
+                : "Upload a PDF on the left, then ask something like:"}
             </p>
-            <div className="flex flex-wrap justify-center gap-2">
-              {["Who is Avinash Shukla?", "What projects has he built?", "Summarize work experience"].map(
-                (suggestion) => (
-                  <button
-                    key={suggestion}
-                    type="button"
-                    onClick={() => void sendMessage(suggestion)}
-                    className="rounded-full border border-gray-200 px-3 py-1.5 text-left text-sm hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-900"
-                  >
-                    {suggestion}
-                  </button>
-                )
-              )}
-            </div>
+            {!readOnly && (
+              <div className="flex flex-wrap justify-center gap-2">
+                {["Who is Avinash Shukla?", "What projects has he built?", "Summarize work experience"].map(
+                  (suggestion) => (
+                    <button
+                      key={suggestion}
+                      type="button"
+                      onClick={() => void sendMessage(suggestion)}
+                      className="rounded-full border border-gray-200 px-3 py-1.5 text-left text-sm hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-900"
+                    >
+                      {suggestion}
+                    </button>
+                  )
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -272,20 +394,29 @@ export function Chat() {
                     Sources ({message.sources.length})
                   </summary>
                   <ul className="mt-2 space-y-2">
-                    {message.sources.map((source, index) => (
-                      <li
-                        key={`${message.id}-source-${index}`}
-                        className="rounded-lg bg-white/70 p-2 text-xs text-gray-600 dark:bg-black/30 dark:text-gray-300"
-                      >
-                        <p className="mb-1 font-medium text-gray-800 dark:text-gray-200">
-                          {source.metadata?.source?.split("/").pop() ?? `Source ${index + 1}`}
-                          {source.metadata?.loc?.pageNumber
-                            ? ` · p.${source.metadata.loc.pageNumber}`
-                            : ""}
-                        </p>
-                        <p className="line-clamp-4 whitespace-pre-wrap">{source.content}</p>
-                      </li>
-                    ))}
+                    {message.sources.map((source, index) => {
+                      const fileName =
+                        source.metadata?.source?.split("/").pop() ?? `Source ${index + 1}`
+                      const page = source.metadata?.loc?.pageNumber
+                      return (
+                        <li
+                          key={`${message.id}-source-${index}`}
+                          className="rounded-lg bg-white/70 p-2 text-xs text-gray-600 dark:bg-black/30 dark:text-gray-300"
+                        >
+                          <button
+                            type="button"
+                            onClick={() => void openSource(source)}
+                            className="mb-1 text-left font-medium text-blue-700 underline-offset-2 hover:underline dark:text-blue-300"
+                            title="Open PDF at this page"
+                          >
+                            {fileName}
+                            {page ? ` · p.${page}` : ""}
+                            <span className="ml-1 font-normal text-gray-400 no-underline">↗</span>
+                          </button>
+                          <p className="line-clamp-4 whitespace-pre-wrap">{source.content}</p>
+                        </li>
+                      )
+                    })}
                   </ul>
                 </details>
               )}
@@ -308,54 +439,54 @@ export function Chat() {
         <p className="shrink-0 pb-2 text-xs text-red-600 dark:text-red-400">{error}</p>
       )}
 
-      <form onSubmit={onSubmit} className="shrink-0 border-t border-gray-200 pt-3 dark:border-gray-800">
-        <div className="flex items-end gap-2 rounded-2xl border border-gray-200 bg-white p-2 dark:border-gray-700 dark:bg-black">
-          <textarea
-            ref={inputRef}
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault()
-                void sendMessage(input)
-              }
-            }}
-            rows={1}
-            placeholder="Ask about your PDF…"
-            className="max-h-32 min-h-[44px] flex-1 resize-none bg-transparent px-2 py-2 text-sm outline-none placeholder:text-gray-400"
-            disabled={loading}
-          />
-          {speechSupported && (
-            <button
-              type="button"
-              onClick={toggleListening}
+      {!readOnly ? (
+        <form onSubmit={onSubmit} className="shrink-0 border-t border-gray-200 pt-3 dark:border-gray-800">
+          <div className="flex items-end gap-2 rounded-2xl border border-gray-200 bg-white p-2 dark:border-gray-700 dark:bg-black">
+            <textarea
+              ref={inputRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault()
+                  void sendMessage(input)
+                }
+              }}
+              rows={1}
+              placeholder="Ask about your PDF…"
+              className="max-h-32 min-h-[44px] flex-1 resize-none bg-transparent px-2 py-2 text-sm outline-none placeholder:text-gray-400"
               disabled={loading}
-              className={`inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl disabled:cursor-not-allowed disabled:opacity-40 ${
-                listening
-                  ? "bg-red-600 text-white"
-                  : "bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
-              }`}
-              aria-label={listening ? "Stop listening" : "Start voice input"}
-              title={listening ? "Stop listening" : "Speak to type"}
+            />
+            {speechSupported && (
+              <button
+                type="button"
+                onClick={toggleListening}
+                disabled={loading}
+                className={`inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl disabled:cursor-not-allowed disabled:opacity-40 ${
+                  listening
+                    ? "bg-red-600 text-white"
+                    : "bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
+                }`}
+                aria-label={listening ? "Stop listening" : "Start voice input"}
+              >
+                {listening ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
+              </button>
+            )}
+            <button
+              type="submit"
+              disabled={loading || !input.trim()}
+              className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gray-900 text-white disabled:cursor-not-allowed disabled:opacity-40 dark:bg-gray-100 dark:text-gray-900"
+              aria-label="Send message"
             >
-              {listening ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
+              {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <SendHorizontal className="h-4 w-4" />}
             </button>
-          )}
-          <button
-            type="submit"
-            disabled={loading || !input.trim()}
-            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gray-900 text-white disabled:cursor-not-allowed disabled:opacity-40 dark:bg-gray-100 dark:text-gray-900"
-            aria-label="Send message"
-          >
-            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <SendHorizontal className="h-4 w-4" />}
-          </button>
+          </div>
+        </form>
+      ) : (
+        <div className="shrink-0 border-t border-gray-200 pt-3 text-center text-xs text-gray-400 dark:border-gray-800">
+          You can view this shared chat, but only the owner can send messages.
         </div>
-        <p className="mt-2 text-center text-[11px] text-gray-400">
-          {listening
-            ? "Listening… click the mic again to stop"
-            : "Enter to send · Shift+Enter for new line · Mic for voice input"}
-        </p>
-      </form>
+      )}
     </div>
   )
 }
