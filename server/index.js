@@ -109,30 +109,12 @@ function assertOwnedUpload(userId, rawPath, roots) {
 }
 
 async function searchUserDocs(query, userId, k = 4) {
-  let docs = await vectorStore.similaritySearch(query, k, {
+  // Strict tenant isolation: only chunks tagged with this userId
+  const docs = await vectorStore.similaritySearch(query, k, {
     must: [{ key: "metadata.userId", match: { value: userId } }],
   })
 
   if (docs.length > 0) return { docs, mode: "userId" }
-
-  const broad = await vectorStore.similaritySearch(query, Math.max(k * 3, 12))
-  docs = broad.filter((d) => {
-    const source = String(d.metadata?.source || "")
-    const metaUser = d.metadata?.userId
-    return (
-      metaUser === userId ||
-      source.includes(`uploads/pdf/${userId}/`) ||
-      source.includes(`uploads/images/${userId}/`)
-    )
-  })
-  if (docs.length > 0) return { docs: docs.slice(0, k), mode: "path" }
-
-  const hasAnyUserScoped = broad.some((d) => d.metadata?.userId)
-  if (!hasAnyUserScoped) {
-    console.warn(`[search] legacy Qdrant index has no userId tags; returning unscoped hits for ${userId}`)
-    return { docs: broad.slice(0, k), mode: "legacy" }
-  }
-
   return { docs: [], mode: "none" }
 }
 
@@ -141,6 +123,34 @@ app.get("/", (req, res) => {
 })
 
 app.use("/chats", chatsRouter)
+
+function buildRagPrompt(query, docs) {
+  const context = docs
+    .map((d, i) => {
+      const kind = d.metadata?.type === "image" ? "Image OCR" : "PDF"
+      const name = d.metadata?.originalname || d.metadata?.filename || "document"
+      return `[${i + 1}] (${kind}: ${name})\n${d.pageContent}`
+    })
+    .join("\n\n")
+
+  return `You are a helpful assistant. Answer the question using the documents below (PDF text and/or OCR text from images).
+Prefer information from the documents. If the documents are unrelated to the question, say "I don't know".
+When an answer comes from an image, mention that it was found in an image.
+
+Documents:
+${context}
+
+Question: ${query}
+
+Answer:`
+}
+
+function mapSources(docs) {
+  return docs.map((d) => ({
+    content: d.pageContent,
+    metadata: d.metadata,
+  }))
+}
 
 app.get("/search", requireUser, async (req, res) => {
   try {
@@ -163,37 +173,15 @@ app.get("/search", requireUser, async (req, res) => {
       })
     }
 
-    const context = docs
-      .map((d, i) => {
-        const kind = d.metadata?.type === "image" ? "Image OCR" : "PDF"
-        const name = d.metadata?.originalname || d.metadata?.filename || "document"
-        return `[${i + 1}] (${kind}: ${name})\n${d.pageContent}`
-      })
-      .join("\n\n")
-
-    const prompt = `You are a helpful assistant. Answer the question using the documents below (PDF text and/or OCR text from images).
-Prefer information from the documents. If the documents are unrelated to the question, say "I don't know".
-When an answer comes from an image, mention that it was found in an image.
-
-Documents:
-${context}
-
-Question: ${query}
-
-Answer:`
-
     const model = genAI.getGenerativeModel({ model: "gemini-3.1-flash-lite" })
-    const result = await model.generateContent(prompt)
+    const result = await model.generateContent(buildRagPrompt(query, docs))
     const answer = result.response.text()
 
     res.json({
       answer,
       userId,
       retrievalMode: mode,
-      sources: docs.map((d) => ({
-        content: d.pageContent,
-        metadata: d.metadata,
-      })),
+      sources: mapSources(docs),
     })
   } catch (err) {
     console.error(err)
